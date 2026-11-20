@@ -330,6 +330,16 @@ class StatsAggregator:
             for type_key, n in rec["redactions"].items():
                 self.redactions[type_key] += n
 
+    def reset(self):
+        with self.lock:
+            self.total = 0
+            self.cache_hits = 0
+            self.redactions = Counter()
+            self.cost_actual = 0.0
+            self.cost_saved = 0.0
+            self.latency_cached.clear()
+            self.latency_uncached.clear()
+
     def snapshot(self):
         def avg(dq):
             return round(sum(dq) / len(dq), 1) if dq else None
@@ -406,6 +416,11 @@ class MemoryBackend:
         with self.lock:
             return list(self.requests)[:limit]
 
+    def reset(self):
+        with self.lock:
+            self.cache.clear()
+            self.requests.clear()
+
 
 class PostgresBackend:
     def __init__(self, dsn):
@@ -456,6 +471,11 @@ class PostgresBackend:
                  "cost_usd": float(r[7]) if r[7] is not None else None, "redacted_prompt": r[8]}
                 for r in rows
             ]
+
+    def reset(self):
+        with self._conn() as conn:
+            conn.execute("delete from cache")
+            conn.execute("delete from requests")
 
 
 class Storage:
@@ -510,6 +530,14 @@ class Storage:
                 self.pg = None
         return self.memory.recent(limit)
 
+    def reset(self):
+        self.memory.reset()
+        if self.pg:
+            try:
+                self.pg.reset()
+            except Exception:
+                self.pg = None
+
 
 storage = Storage()
 
@@ -529,6 +557,10 @@ class ArchiveBuffer:
             full = len(self.buffer) >= ARCHIVE_BATCH_SIZE
         if full:
             self.flush()
+
+    def clear(self):
+        with self.lock:
+            self.buffer = []
 
     def flush(self):
         if not s3:
@@ -676,6 +708,14 @@ def api_stats():
 @app.get("/api/requests")
 def api_requests(limit: int = 20):
     return storage.recent(max(1, min(limit, 100)))
+
+
+@app.post("/api/reset")
+def api_reset():
+    storage.reset()
+    stats.reset()
+    archive_buffer.clear()
+    return {"status": "reset"}
 
 
 @app.post("/api/archive")
