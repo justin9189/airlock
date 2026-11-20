@@ -72,11 +72,15 @@
   th, td { text-align: left; padding: .5rem .6rem; border-bottom: 1px solid var(--border); white-space: nowrap; }
   th { color: var(--muted); font-weight: 600; font-size: .75rem; text-transform: uppercase; letter-spacing: .03em; }
   td.prompt { white-space: normal; max-width: 420px; font-family: var(--mono); font-size: .8rem; color: var(--muted); }
-  td.cache-hit { color: var(--safe); } td.cache-miss { color: var(--warn); }
+  td.cache-hit { color: var(--safe); } td.cache-miss { color: var(--warn); } td.cache-blocked { color: var(--accent); font-weight: 600; }
   #requestsTableWrap { overflow-x: auto; }
   .muted { color: var(--muted); }
   .panel-header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; margin-bottom: .75rem; }
   #archiveResult { font-size: .85rem; color: var(--safe); font-family: var(--mono); }
+  .snippet-wrap { position: relative; }
+  .snippet-wrap .pane { padding-right: 4rem; }
+  .copy-btn { position: absolute; top: .5rem; right: .5rem; padding: .25rem .6rem; font-size: .75rem; }
+  code { font-family: var(--mono); }
   footer { text-align: center; color: var(--muted); font-size: .8rem; padding: 2rem 1rem 3rem; }
 </style>
 </head>
@@ -97,6 +101,8 @@
     <textarea id="prompt" placeholder="Ask anything. Try pasting an email, phone number, or API key — AIRLOCK strips it before the model ever sees it."></textarea>
     <div class="controls">
       <button id="loadDemo" class="ghost">Load demo prompt</button>
+      <button id="loadErrorLog" class="ghost">Load error log</button>
+      <button id="loadPrivateKey" class="ghost">Load private key</button>
       <label class="check"><input type="checkbox" id="restoreToggle" checked> restore real values in the response</label>
       <span class="spacer"></span>
       <button id="send" class="primary">Send</button>
@@ -140,19 +146,70 @@
       </table>
     </div>
   </section>
+
+  <section class="card">
+    <h2>Use AIRLOCK in your app</h2>
+    <p class="muted" style="margin-top:-.4rem">Point any client at <code>POST /v1/chat</code>. Everything above runs the same path.</p>
+    <div class="grid-2">
+      <div class="panel">
+        <h3>curl</h3>
+        <div class="snippet-wrap">
+          <pre class="pane" id="snippetCurl">curl -X POST http://localhost:8000/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Reach me at jane@example.com"}],
+    "restore": true
+  }'</pre>
+          <button class="ghost copy-btn" data-target="snippetCurl">Copy</button>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Python</h3>
+        <div class="snippet-wrap">
+          <pre class="pane" id="snippetPython">import requests
+
+response = requests.post(
+    "http://localhost:8000/v1/chat",
+    json={
+        "messages": [{"role": "user", "content": "Reach me at jane@example.com"}],
+        "restore": True,
+    },
+)
+print(response.json()["response"])</pre>
+          <button class="ghost copy-btn" data-target="snippetPython">Copy</button>
+        </div>
+      </div>
+    </div>
+  </section>
 </main>
 
 <footer>AIRLOCK — a demo gateway in front of Akamai Inference, PostgreSQL, and Object Storage. Fake data only.</footer>
 
 <script>
 const $ = (id) => document.getElementById(id);
-const DEMO_PROMPT = "Hi, I'm migrating our support inbox before the audit. My contact is dana.whitfield@fairwindlogistics.com and my direct line is 425-555-0147 if you need to reach me. Our staging key is sk-proj-7h2k9m1x4q8w3e6r5t0y — please remind me never to commit it. Draft a two-line reminder note to myself that repeats my email, phone, and key back so I can paste it into our runbook.";
+const DEMO_PROMPT = "I'm a support agent. A customer named Priya Nanda just emailed priya.nanda87@meridianfreightco.com from 702-555-0138 about order #FW-88213-A. She says the package never arrived and she's frustrated. Our error log also shows sk-live-7h2k9m1x4q8w3e6r5t0y attached to that request by mistake. Draft a short, empathetic reply to her about the missing order — don't worry about the API key, just focus on the customer reply.";
+const ERROR_LOG_PROMPT = `Can you help me make sense of this crash? Here's the log:
+
+Traceback (most recent call last):
+  File "worker.py", line 42, in process_order
+    conn = psycopg2.connect("postgres://orders_svc:Tr0ub4dor&3xZ@db-prod-01.internal:5432/orders")
+  File "client.py", line 18, in call_billing_api
+    headers = {"Authorization": "Bearer sk-live-9f8a7b6c5d4e3f2a1b0c4d7e2f1a0b3c"}
+ConnectionError: could not connect to db-prod-01.internal:5432
+
+What's the most likely cause, and what should I check first?`;
+const PRIVATE_KEY_PROMPT = `Does this SSH key look right, or did I truncate it when copying?
+
+-----BEGIN RSA PRIVATE KEY-----
+MIIBOgIBAAJBAKj34GkxFhD90vcNLYLInFEX6Ppy1tPf9Cnzj4p4WGeKLs1Pt8Qu
+KUpRKfFLfRYC9AIKjbJTWit+CqvjWYzvQwECAwEAAQ==
+-----END RSA PRIVATE KEY-----`;
 const PLACEHOLDER_RE = /\[[A-Z][A-Z0-9_]*_\d+\]/g;
 
 async function getJSON(url, options) {
   const response = await fetch(url, options);
   const data = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(data.error || data.detail || response.statusText);
+  if (!response.ok) throw new Error(data.detail || data.error || response.statusText);
   return data;
 }
 
@@ -197,6 +254,7 @@ function renderBadges(backends) {
 const STAT_DEFS = [
   { key: "total_requests", label: "Requests", format: (v) => Math.round(v).toLocaleString() },
   { key: "secrets_blocked", label: "Secrets blocked", format: (v) => Math.round(v).toLocaleString(), cls: "accent" },
+  { key: "private_keys_blocked", label: "Private keys rejected", format: (v) => Math.round(v).toLocaleString(), cls: "accent" },
   { key: "cache_hit_rate", label: "Cache hit rate", format: (v) => `${Math.round(v * 100)}%`, cls: "safe" },
   { key: "cost_saved_usd", label: "$ saved by cache", format: (v) => `$${v.toFixed(4)}`, cls: "safe" },
   { key: "avg_latency_ms_uncached", label: "Latency, live", format: (v) => `${Math.round(v)} ms`, cls: "warn" },
@@ -231,9 +289,13 @@ function renderRequests(rows) {
     const tr = document.createElement("tr");
     const time = row.created_at ? new Date(row.created_at).toLocaleTimeString() : "—";
     const redactionCount = Object.values(row.redactions || {}).reduce((a, b) => a + b, 0);
+    const blocked = !!(row.redactions && row.redactions.PRIVATE_KEY);
+    const cacheCell = blocked
+      ? `<td class="cache-blocked">blocked</td>`
+      : `<td class="${row.cache_hit ? "cache-hit" : "cache-miss"}">${row.cache_hit ? "hit" : "miss"}</td>`;
     tr.innerHTML = `
       <td>${time}</td>
-      <td class="${row.cache_hit ? "cache-hit" : "cache-miss"}">${row.cache_hit ? "hit" : "miss"}</td>
+      ${cacheCell}
       <td>${row.latency_ms} ms</td>
       <td>${redactionCount}</td>
       <td>$${Number(row.cost_usd ?? 0).toFixed(5)}</td>
@@ -260,6 +322,20 @@ function refreshAll() { refreshStats(); refreshRequests(); }
 
 // --- playground ------------------------------------------------------------
 $("loadDemo").addEventListener("click", () => { $("prompt").value = DEMO_PROMPT; });
+$("loadErrorLog").addEventListener("click", () => { $("prompt").value = ERROR_LOG_PROMPT; });
+$("loadPrivateKey").addEventListener("click", () => { $("prompt").value = PRIVATE_KEY_PROMPT; });
+
+document.querySelectorAll(".copy-btn").forEach((btn) => {
+  btn.addEventListener("click", async () => {
+    const text = $(btn.dataset.target).textContent;
+    try {
+      await navigator.clipboard.writeText(text);
+      const original = btn.textContent;
+      btn.textContent = "Copied";
+      setTimeout(() => { btn.textContent = original; }, 1200);
+    } catch (error) { /* clipboard permission denied; nothing to recover */ }
+  });
+});
 
 $("send").addEventListener("click", async () => {
   const text = $("prompt").value.trim();

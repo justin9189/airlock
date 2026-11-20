@@ -198,11 +198,15 @@ SECRET_PREFIX_PATTERNS = [
     re.compile(r"\bghp_[A-Za-z0-9]{30,}\b"),
 ]
 BEARER_PATTERN = re.compile(r"\b(Bearer\s+)([A-Za-z0-9\-_.]{10,})\b", re.IGNORECASE)
+CONN_STRING_PATTERN = re.compile(
+    r"\b((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^\s/:@]+:)([^\s@]+)(@)", re.IGNORECASE
+)
 GENERIC_TOKEN_PATTERNS = [
     re.compile(r"\b[A-Fa-f0-9]{32,}\b"),
     re.compile(r"\b[A-Za-z0-9+/]{40,}={0,2}\b"),
 ]
 PLACEHOLDER_PATTERN = re.compile(r"\[[A-Z][A-Z0-9_]*_\d+\]")
+PRIVATE_KEY_PATTERN = re.compile(r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----")
 
 
 def luhn_valid(raw):
@@ -249,10 +253,16 @@ def build_redactor():
         counts["API_KEY"] += 1
         return f"{m.group(1)}{placeholder_for(token, 'API_KEY')}"
 
+    def connstring_repl(m):
+        password = m.group(2)
+        counts["DB_PASSWORD"] += 1
+        return f"{m.group(1)}{placeholder_for(password, 'DB_PASSWORD')}{m.group(3)}"
+
     def apply(text):
         for pattern in SECRET_PREFIX_PATTERNS:
             text = pattern.sub(make_repl("API_KEY"), text)
         text = BEARER_PATTERN.sub(bearer_repl, text)
+        text = CONN_STRING_PATTERN.sub(connstring_repl, text)
         text = CREDITCARD_PATTERN.sub(make_repl("CREDIT_CARD", luhn_valid), text)
         text = SSN_PATTERN.sub(make_repl("SSN"), text)
         text = EMAIL_PATTERN.sub(make_repl("EMAIL"), text)
@@ -560,6 +570,24 @@ def gateway_chat(body: ChatRequest, request: Request):
 
     start = time.monotonic()
     request_id = str(uuid.uuid4())
+
+    key_hits = sum(len(PRIVATE_KEY_PATTERN.findall(m.content)) for m in body.messages)
+    if key_hits:
+        record = {
+            "id": request_id, "created_at": datetime.now(timezone.utc).isoformat(),
+            "latency_ms": int((time.monotonic() - start) * 1000), "cache_hit": False,
+            "redactions": {"PRIVATE_KEY": key_hits}, "tokens_in": 0, "tokens_out": 0,
+            "cost_usd": 0.0, "est_cost_if_uncached": 0.0,
+            "redacted_prompt": "[blocked: private key material detected, request rejected before reaching the model]",
+        }
+        storage.log_request(record)
+        stats.record(record)
+        return JSONResponse(status_code=400, content={
+            "error": "blocked", "id": request_id, "blocked_type": "PRIVATE_KEY",
+            "detail": "This message contains what looks like a private key (-----BEGIN ... PRIVATE KEY-----). "
+                      "AIRLOCK rejects it outright instead of forwarding it anywhere, redacted or not.",
+        })
+
     apply_redaction, mapping, occurrence_counts = build_redactor()
     redacted_messages = [{"role": m.role, "content": apply_redaction(m.content)} for m in body.messages]
     redacted_prompt = next(
@@ -636,6 +664,7 @@ def gateway_chat(body: ChatRequest, request: Request):
 @app.get("/api/stats")
 def api_stats():
     snapshot = stats.snapshot()
+    snapshot["private_keys_blocked"] = snapshot["redactions_by_type"].get("PRIVATE_KEY", 0)
     snapshot["backends"] = {
         "inference": "configured",
         "postgresql": "connected" if storage.pg else "fallback: in-memory",
